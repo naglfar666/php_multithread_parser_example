@@ -81,7 +81,6 @@ $Prepare_Code = function ($data) {
  * @return double - Результат конвертации с округлением до сотых
  */
 $Prepare_Price = function ($data) use ($course) {
-  print_r($course);
   return round($data * $course, 2);
 };
 

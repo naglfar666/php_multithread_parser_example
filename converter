@@ -1,0 +1,320 @@
+<?php
+class Converter {
+
+  private $filename = null;
+  private $file = null;
+  private $course = null;
+  private $threads = null;
+
+  /**
+   * Инициализация класса Converter
+   *
+   * @param string $filename - Путь к файлу
+   * @param double $course - Курс для конвертации
+   * @param integer $threads - Количество потоков, в которых будет запущен разбор файла
+   */
+  public function __construct($filename, $course, $threads)
+  {
+    $this->filename = $filename;
+    $this->file = new SplFileObject($filename, 'r');
+    $this->course = $course;
+    $this->threads = $threads;
+  }
+  /**
+   * Начало парсинга файла.
+   * Определяем количество строк в файле и разбиваем его на равные части
+   * @return void
+   */
+  public function start()
+  {
+    $this->file->seek(PHP_INT_MAX);
+    $Lines_Count = $this->file->key() + 1;
+    // Разделяем файлы на более маленькие по размеру
+    $Lines_Array = $this->_split_file($Lines_Count);
+    if ($Lines_Array['min'] > 0) {
+      // Проверяем готовность всех файлов
+      while (true) {
+        // Если файлы готовы, продолжаем выполнение скрипта
+        if ($this->_files_ready($Lines_Array['min'], $Lines_Array['max'], 'buffer', 'csv')) {
+          echo 'Все файлы готовы, начинаем парсинг'.PHP_EOL;
+          break;
+        }
+        // Ожидаем секунду перед следующей итерацией, чтобы не перегружать файловую систему
+        sleep(1);
+      }
+      // Начинаем парсинг
+      if ($this->_start_parsing()) {
+        // Если результаты готовы, уведомляем пользователя и продолжаем исполнение скрипта
+        while (true) {
+          if ($this->_files_ready($Lines_Array['min'], $Lines_Array['max'], 'buffer_result', 'xml')) {
+            echo 'Результаты готовы, собираем итоговый файл'.PHP_EOL;
+            break;
+          }
+          // Ожидаем секунду перед следующей итерацией, чтобы не перегружать файловую систему
+          sleep(1);
+        }
+        // Собираем итоговый файл
+        $this->_create_result();
+      }
+    }
+    echo 'Удаляем временные файлы'.PHP_EOL;
+    // Подчищаем файловую систему
+    $this->_clean();
+    echo 'Ваш файл output.xml готов'.PHP_EOL;
+  }
+  /**
+   * Разбитие большого файла на несколько маленьких файлов
+   *
+   * @param integer $lines_count - Общее количество строк в файле
+   * @return array - Минимальное и максимальное количество строк в файле
+   */
+  private function _split_file($lines_count)
+  {
+    if (!$this->_actualize_filesystem()) {
+      echo 'Не удалось актуализировать файловую систему'.PHP_EOL;
+      exit;
+    }
+    echo 'Подготавливаем файл к чтению'.PHP_EOL;
+    // Если количество строк модульно количеству потоков, записываем количество линий
+    if ($lines_count % $this->threads == 0) {
+      $lines_to_split = $lines_count / $this->threads;
+      $last_file_lines = 0;
+    // В остальных случаях записываем количество строк для последнего файла
+    } else {
+      $lines_remain = $lines_count % $this->threads;
+      $lines_module = $lines_count - $lines_remain;
+      $lines_to_split = $lines_module / $this->threads;
+      $last_file_lines = $lines_to_split + $lines_remain;
+    }
+    // Запускаем разбиение большого файла на меленькие
+    for ($i = 0; $i < $this->threads; $i++) {
+      // Если первый поток, начинаем с нуля, заканчиваем количеством строк - 1
+      if ($i == 0) {
+        $start = 0;
+        $end = $lines_to_split - 1;
+      // В других случаях начало - количество строк * поток. Конец - количество строк * (поток + 1) - 1
+      } else {
+        $start = $lines_to_split * $i;
+        $end = $lines_to_split * ($i + 1) - 1;
+        if ($i == $this->threads - 1) {
+          $end += $last_file_lines;
+        }
+      }
+      // Запускаем разбиение файла и отвязываем скрипт от консоли
+      $command = 'php handlers/file_seeker.php ' // Файл для открытия
+              . '--start='.$start.' ' // Начало поиска
+              . '--end='.$end.' ' // Конец поиска
+              . '--file='.$this->filename.' ' // Название файла, из которого будет производиться поиск
+              . '--th='.($i + 1).' &'; // Порядковый номер потока и отвязывание от консоли
+
+      exec($command);
+    }
+    return [
+      'min' => $lines_to_split,
+      'max' => $last_file_lines,
+    ];
+  }
+  /**
+   * Актуализация файловой системы
+   * @return boolean Удалось ли актуализировать файловую систему
+   */
+  private function _actualize_filesystem()
+  {
+    echo 'Актуализируем файловую систему'.PHP_EOL;
+    if (!file_exists('buffer')) {
+      mkdir('buffer');
+    }
+    if (!file_exists('buffer_result')) {
+      mkdir('buffer_result');
+    }
+    if (file_exists('buffer') && file_exists('buffer_result')) {
+      return true;
+    }
+    return false;
+  }
+  /**
+   * Проверяем готовость всех маленьких файлов
+   *
+   * @param integer $lines_min - Минимальное количество строк, содержащихся в файле
+   * @param integer $lines_max - Максимальное количество строк, содержащихся в файле
+   * @param string $folder - Папка, в которой искать файлы
+   * @param string $format - Формат файла
+   *
+   * @return boolean - Все ли файлы готовы
+   */
+  private function _files_ready($lines_min, $lines_max, $folder, $format)
+  {
+    // Количество готовых файлов
+    $files_ready = 0;
+    // Проверяем по всем потокам готовность файлов
+    for ($i = 0; $i < $this->threads; $i++) {
+      // Находим количество строк в каждом файле
+      if (!file_exists($folder.'/'.($i + 1).'.'.$format)) continue;
+      $file = new SplFileObject($folder . '/' . ($i + 1) . '.' . $format, 'r');
+      $file->seek(PHP_INT_MAX);
+      $lines_count = $file->key() + 1;
+
+      // Для последнего потока проверяем максимальное количество строк
+      if ($i == $this->threads - 1) {
+        if ($lines_max > 0) {
+          if ($lines_count >= $lines_max) {
+            $files_ready++;
+          }
+        } else {
+          if ($lines_count >= $lines_min) {
+            $files_ready++;
+          }
+        }
+
+      // Для всех остальных выбираем минимальное количество строк
+      } else {
+        if ($lines_count >= $lines_min) {
+          $files_ready++;
+        }
+      }
+      // Убираем объект из памяти
+      $file = null;
+    }
+    if ($files_ready == $this->threads) {
+      return true;
+    }
+    return false;
+  }
+  /**
+   * Начинаем парсинг всех разбитых файлов
+   *
+   * @return boolean|null - Был ли начат парсинг файлов
+   */
+  private function _start_parsing()
+  {
+    // Находим требуемые индексы для парсеров
+    $line_to_search = 0;
+    $code_index = -1;
+    $price_index = -1;
+    // Ищем среди первых 10 строк Код и Цену
+    while ($line_to_search < 10) {
+      // Получаем строку из большого файла
+      $this->file->seek($line_to_search);
+      $line_content = $this->file->current();
+
+      // Если на ней находится слово Код, определяем индексы кода и цены
+      if (mb_stristr($line_content, 'Код')) {
+        $line_content_array = explode(';', $line_content);
+        for ($i = 0; $i < count($line_content_array); $i++) {
+          if (mb_stristr($line_content_array[$i], 'Код')) {
+            $code_index = $i;
+          } else if (mb_stristr($line_content_array[$i], 'Цена')) {
+            $price_index = $i;
+          }
+        }
+        break;
+      }
+      $line_to_search++;
+    }
+    if ($code_index == -1 || $price_index == -1) {
+      echo 'Не были найдены индексы цены и кода товара'.PHP_EOL;
+      exit;
+    }
+
+    for ($i = 0; $i < $this->threads; $i++) {
+      // Запускаем на каждый поток парсер и отвязываем от консоли
+      $command = 'php handlers/file_parser.php ' // Запуск скрипта
+              .'--file=buffer/' . ($i + 1) . '.csv ' // Название файла, откуда будет производиться парсинг
+              .'--th='.($i + 1).' ' // Порядковый номер потока
+              .'--pr-i=' . $price_index . ' ' // Индекс колонки цены
+              .'--c-i=' . $code_index . ' ' // Индекс колонки кода
+              .'--c=' . $this->course . ' &'; // Курс для конвертации и отвязывание от консоли
+      exec($command);
+    }
+    return true;
+  }
+  /**
+   * Собираем итоговый файл, объединив все маленькие файлы
+   */
+  private function _create_result()
+  {
+    if (file_exists('output.xml')) {
+      unlink('output.xml');
+    }
+    $result_func = function () {
+      $file = fopen('output.xml', 'a');
+      while (true) {
+        $data = yield;
+        if ($data == 'close') {
+          fclose($file);
+          return true;
+        }
+        fwrite($file, $data);
+      }
+    };
+
+    $result_generator = $result_func();
+    $result_generator->send('<items>');
+    for ($i = 0; $i < $this->threads; $i++) {
+        $result_generator->send(file_get_contents('buffer_result/' . ($i + 1) . '.xml'));
+    }
+    $result_generator->send('</items>');
+    if($result_generator->send('close')) {
+      return true;
+    }
+    return false;
+  }
+  /**
+   * Подчищаем файловую систему
+   *
+   * @return void
+   */
+  private function _clean()
+  {
+    $buffer_results = scandir('buffer_result');
+    for ($i = 0; $i < count($buffer_results); $i++) {
+      if ($buffer_results[$i] != '.' && $buffer_results[$i] != '..') {
+        unlink('buffer_result/'.$buffer_results[$i]);
+      }
+    }
+    $buffers = scandir('buffer');
+    for ($i = 0; $i < count($buffers); $i++) {
+      if ($buffers[$i] != '.' && $buffers[$i] != '..') {
+        unlink('buffer/'.$buffers[$i]);
+      }
+    }
+  }
+}
+// Получаем ключевые аргументы
+foreach ($argv as $key => $value) {
+  if (mb_stristr($argv[$key], '--f')) {
+    $File_Array = explode('=',$argv[$key]);
+    $file_to_open = $File_Array[1];
+  } else if (mb_stristr($argv[$key], '--c')) {
+    $Course_Array = explode('=', $argv[$key]);
+    $course = (double) $Course_Array[1];
+  } else if (mb_stristr($argv[$key], '--th')) {
+    $Thread_Array = explode('=', $argv[$key]);
+    $threads = (integer) $Thread_Array[1];
+  }
+}
+
+if (!is_string($file_to_open)) {
+  echo 'Неверно введено имя файла'.PHP_EOL;
+  exit;
+}
+
+if (!file_exists($file_to_open)) {
+  echo 'Указанного файла не существует'.PHP_EOL;
+  exit;
+}
+
+if ($course <= 0) {
+  echo 'Курс не может быть меньше либо равен 0'.PHP_EOL;
+  exit;
+}
+
+if ($threads <= 0) {
+  echo 'Количество потоков не может быть меньше либо равно 0'.PHP_EOL;
+  exit;
+}
+
+$Converter = new Converter($file_to_open, $course, $threads);
+$Converter->start();
+
+?>
